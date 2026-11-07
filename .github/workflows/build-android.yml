@@ -1,0 +1,120 @@
+name: Build React Native APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: klencod-rn-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      - name: Install npm dependencies
+        shell: bash
+        run: |
+          npm install --no-audit --no-fund
+          npm install --save-dev --no-audit --no-fund \
+            @react-native-community/cli@15.0.1 \
+            @react-native-community/cli-platform-android@15.0.1 \
+            @react-native-community/cli-platform-ios@15.0.1
+
+      - name: Verify native Android template
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_ID=$(node -e "const a=require('./app.json'); const n=(a.name||'app').toLowerCase().replace(/[^a-z0-9]+/g,'_'); console.log((a.android&&a.android.packageName)||('com.example.'+n));")
+          APP_PATH=$(printf '%s' "$APP_ID" | tr '.' '/')
+          test -f android/settings.gradle
+          test -f android/build.gradle
+          test -f android/app/build.gradle
+          test -f android/app/src/main/AndroidManifest.xml
+          test -f "android/app/src/main/java/$APP_PATH/MainActivity.kt" || test -f "android/app/src/main/java/$APP_PATH/MainActivity.java"
+          test -f "android/app/src/main/java/$APP_PATH/MainApplication.kt" || test -f "android/app/src/main/java/$APP_PATH/MainApplication.java"
+          test -f "android/app/src/main/java/$APP_PATH/CrashLogger.java"
+          test -f "android/app/src/main/java/$APP_PATH/AppLoggerPackage.java"
+          grep -R "CrashLogger.install" "android/app/src/main/java/$APP_PATH"
+          grep -R "add(AppLoggerPackage())" "android/app/src/main/java/$APP_PATH"
+          echo "Native Android template verified."
+
+      - name: Prepare debug signing key
+        working-directory: android/app
+        shell: bash
+        run: |
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Build release APK
+        shell: bash
+        run: |
+          set -o pipefail
+          LOG="$RUNNER_TEMP/klencod-rn-gradle.log"
+
+          if [ -f android/gradlew ]; then
+            echo "✅ Using Gradle Wrapper (android/gradlew)"
+            chmod +x android/gradlew || true
+            (cd android && ./gradlew --no-daemon --build-cache \
+              assembleRelease 2>&1 | tee "$LOG")
+          else
+            echo "⚠️ android/gradlew غير موجود — استخدام gradle من النظام"
+            echo "ℹ️ هذا شائع في المشاريع المستوردة من الخارج"
+            gradle -p android --no-daemon --build-cache \
+              assembleRelease 2>&1 | tee "$LOG"
+          fi
+
+      - name: Print compiler diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          LOG="$RUNNER_TEMP/klencod-rn-gradle.log"
+          echo "===== Klencod React Native diagnostics ====="
+          if [[ -f "$LOG" ]]; then
+            grep -E 'error:|warning:|FAILED|Compilation failed|BUILD FAILED|What went wrong' "$LOG" | tail -n 150 || true
+          else
+            echo "Gradle output file was not created."
+          fi
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: klencod-reactnative-release-apk
+          path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 7
